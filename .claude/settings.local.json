@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(tasklist)",
+      "Bash(tasklist.exe:*)",
+      "Bash(netstat -ano)",
+      "Bash(tasklist:*)",
+      "Bash(findstr \"16536\")",
+      "Bash(wmic process:*)",
+      "Bash(claude session:*)"
+    ]
+  }
+}
