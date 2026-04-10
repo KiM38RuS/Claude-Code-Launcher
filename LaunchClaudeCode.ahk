@@ -6,6 +6,10 @@
 #SingleInstance Force
 #NoTrayIcon
 
+;@Ahk2Exe-SetName Claude Code Launcher
+;@Ahk2Exe-SetDescription Лаунчер для Claude Code через Omniroute
+;@Ahk2Exe-SetVersion 1.1
+
 ; === ВЕРСИЯ ===
 SCRIPT_VERSION := "v1.1"
 
