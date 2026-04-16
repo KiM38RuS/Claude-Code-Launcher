@@ -24,7 +24,7 @@
 ## Возможности
 
 ### Основные функции
-* GUI для выбора папки проекта<img src="Assets/Screenshot-v1.1.jpg" width="450" align="right">
+* GUI для выбора папки проекта<img src="Assets/Screenshot-v2.0.jpg" width="450" align="right">
 * История последних использованных папок (до 10)
 * Автоматический запуск **Omniroute**, если он не запущен
 * Проверка успешного запуска Omniroute
