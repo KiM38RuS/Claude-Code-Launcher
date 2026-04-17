@@ -8,7 +8,29 @@
 
 ;@Ahk2Exe-SetName Claude Code Launcher
 ;@Ahk2Exe-SetDescription Лаунчер для Claude Code через Omniroute
-;@Ahk2Exe-SetVersion 1.2.0
+;@Ahk2Exe-SetVersion 1.3.0
+
+; === ОБРАБОТЧИК ОШИБОК ===
+OnError(LogErrorToFile)
+
+LogErrorToFile(exception, mode) {
+    errorLog := A_ScriptDir "\ahk_error.log"
+    timestamp := FormatTime(, "yyyy-MM-dd HH:mm:ss")
+
+    errorText := "[" timestamp "]`n"
+    errorText .= "Error: " exception.Message "`n"
+    errorText .= "What: " exception.What "`n"
+    errorText .= "Extra: " exception.Extra "`n"
+    errorText .= "File: " exception.File "`n"
+    errorText .= "Line: " exception.Line "`n"
+    errorText .= "Stack:`n" exception.Stack "`n`n"
+
+    try {
+        FileAppend(errorText, errorLog, "UTF-8")
+    }
+
+    return 0  ; Показать стандартное окно ошибки
+}
 
 ; === ГОРЯЧИЕ КЛАВИШИ ===
 #HotIf WinActive("ahk_id " mainGui.Hwnd)
@@ -16,15 +38,15 @@ F5::Reload
 #HotIf
 
 ; === ВЕРСИЯ ===
-SCRIPT_VERSION := "v1.2.0"
+SCRIPT_VERSION := "v1.3.0"
 
 ; === НАСТРОЙКИ ===
 MAX_HISTORY := 10  ; Максимальное количество папок в истории
 TIMEOUT_SECONDS := 30  ; Таймаут ожидания запуска Omniroute (в секундах)
-HISTORY_FILE := A_ScriptDir "\cc_history.txt"
+CONFIG_FILE := A_ScriptDir "\cc_launcher.ini"  ; Единый файл конфигурации
 CLAUDE_SESSIONS_DIR := EnvGet("USERPROFILE") "\.claude\sessions"  ; Папка с сессиями Claude Code
 USE_NEW_TAB := true  ; Запускать в новой вкладке Windows Terminal (Windows 11)
-ENABLE_LOGGING := false  ; Включить логирование (true/false)
+ENABLE_LOGGING := true  ; Включить логирование (true/false)
 LOG_FILE := A_ScriptDir "\cc_launcher.log"  ; Файл лога
 
 ; === ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ===
@@ -71,6 +93,9 @@ Main() {
     ; Регистрируем обработчик завершения работы
     OnExit(OnShutdown)
 
+    ; Восстанавливаем активные сессии
+    RestoreActiveSessions()
+
     ; Инициализируем WMI мониторинг процессов
     InitProcessMonitoring()
 
@@ -80,22 +105,100 @@ Main() {
 
 ; === ЗАГРУЗКА ИСТОРИИ ===
 LoadHistory() {
-    global historyList
+    global historyList, CONFIG_FILE
     historyList := []
 
-    if FileExist(HISTORY_FILE) {
-        content := FileRead(HISTORY_FILE)
+    ; Миграция из старого формата (cc_history.txt)
+    oldHistoryFile := A_ScriptDir "\cc_history.txt"
+    if FileExist(oldHistoryFile) {
+        Log("Миграция истории из cc_history.txt")
+        content := FileRead(oldHistoryFile)
         Loop Parse, content, "`n", "`r" {
             if (A_LoopField != "" && DirExist(A_LoopField)) {
                 historyList.Push(A_LoopField)
             }
         }
+        ; Сохраняем в новый формат
+        if (historyList.Length > 0) {
+            SaveHistory(historyList[1])  ; Сохранит весь список
+        }
+        ; Удаляем старый файл
+        try {
+            FileDelete(oldHistoryFile)
+            Log("Старый файл cc_history.txt удалён")
+        }
+        return
     }
+
+    ; Миграция позиции окна из старого файла
+    oldPositionFile := A_ScriptDir "\cc_position.ini"
+    if FileExist(oldPositionFile) {
+        Log("Миграция позиции окна из cc_position.ini")
+        oldX := IniRead(oldPositionFile, "Window", "X", "")
+        oldY := IniRead(oldPositionFile, "Window", "Y", "")
+        if (oldX != "" && oldY != "") {
+            IniWrite(oldX, CONFIG_FILE, "Window", "X")
+            IniWrite(oldY, CONFIG_FILE, "Window", "Y")
+            Log("Позиция окна мигрирована: X=" oldX ", Y=" oldY)
+        }
+        ; Удаляем старый файл
+        try {
+            FileDelete(oldPositionFile)
+            Log("Старый файл cc_position.ini удалён")
+        }
+    }
+
+    ; Читаем историю из INI файла
+    Loop 10 {
+        folder := IniRead(CONFIG_FILE, "History", "Folder" A_Index, "")
+        if (folder != "" && DirExist(folder)) {
+            historyList.Push(folder)
+        }
+    }
+}
+
+; === ВОССТАНОВЛЕНИЕ АКТИВНЫХ СЕССИЙ ===
+RestoreActiveSessions() {
+    global activeSessions, CLAUDE_SESSIONS_DIR
+
+    Log("=== Восстановление активных сессий ===")
+
+    ; Читаем все JSON файлы сессий
+    Loop Files, CLAUDE_SESSIONS_DIR "\*.json" {
+        try {
+            content := FileRead(A_LoopFileFullPath, "UTF-8")
+
+            ; Извлекаем pid, cwd и sessionId из JSON
+            if RegExMatch(content, '"pid"\s*:\s*(\d+)', &pidMatch) {
+                pid := Integer(pidMatch[1])
+
+                if RegExMatch(content, '"cwd"\s*:\s*"([^"]+)"', &cwdMatch) {
+                    folderPath := StrReplace(cwdMatch[1], "\\", "\")
+
+                    if RegExMatch(content, '"sessionId"\s*:\s*"([^"]+)"', &sessionMatch) {
+                        sessionId := sessionMatch[1]
+
+                        ; Проверяем, существует ли процесс с этим PID
+                        if ProcessExist(pid) {
+                            activeSessions[folderPath] := {pid: pid, sessionId: sessionId}
+                            Log("Восстановлена сессия: Папка=" folderPath ", PID=" pid ", SessionID=" sessionId)
+                        } else {
+                            Log("Процесс не существует для сессии: PID=" pid ", Папка=" folderPath ", SessionID=" sessionId)
+                        }
+                    }
+                }
+            }
+        } catch as err {
+            Log("Ошибка чтения файла " A_LoopFileFullPath ": " err.Message, "ERROR")
+        }
+    }
+
+    Log("Восстановлено сессий: " activeSessions.Count)
 }
 
 ; === СОХРАНЕНИЕ ИСТОРИИ ===
 SaveHistory(newFolder) {
-    global historyList, MAX_HISTORY
+    global historyList, MAX_HISTORY, CONFIG_FILE
 
     ; Удаляем папку из списка, если она уже есть
     for index, folder in historyList {
@@ -113,16 +216,14 @@ SaveHistory(newFolder) {
         historyList.Pop()
     }
 
-    ; Сохраняем в файл
-    content := ""
-    for folder in historyList {
-        content .= folder "`n"
+    ; Сохраняем в INI файл
+    Loop MAX_HISTORY {
+        if (A_Index <= historyList.Length) {
+            IniWrite(historyList[A_Index], CONFIG_FILE, "History", "Folder" A_Index)
+        } else {
+            IniDelete(CONFIG_FILE, "History", "Folder" A_Index)
+        }
     }
-
-    try {
-        FileDelete(HISTORY_FILE)
-    }
-    FileAppend(content, HISTORY_FILE)
 }
 
 ; === GUI ДЛЯ ВЫБОРА ПАПКИ ===
@@ -168,7 +269,9 @@ ShowFolderSelectionGUI() {
 
     ; Чекбокс для режима пропуска разрешений
     skipPermissionsCheckbox := mainGui.Add("Checkbox", "x10 y120 vSkipPermissions", "Запустить в режиме пропуска разрешений")
-    skipPermissionsCheckbox.Value := false
+    ; Загружаем сохранённое состояние
+    skipPermissionsCheckbox.Value := IniRead(CONFIG_FILE, "Settings", "SkipPermissions", "0") = "1"
+    skipPermissionsCheckbox.OnEvent("Click", (*) => OnSkipPermissionsClick(skipPermissionsCheckbox, mainGui))
 
     ; Кнопки Сброс, Запустить и Закрыть
     resetBtn := mainGui.Add("Button", "x10 y150 w80 h30", "Сброс")
@@ -186,11 +289,115 @@ ShowFolderSelectionGUI() {
     mainGui.Add("Text", "x10 y195", "Активные сессии:")
     sessionsContainer := mainGui.Add("Text", "x10 y220 w490 h20", "")
 
-    mainGui.OnEvent("Close", (*) => ExitApp())
-    mainGui.Show("w510 h250")
+    ; Загружаем сохранённую позицию окна
+    savedX := IniRead(CONFIG_FILE, "Window", "X", "")
+    savedY := IniRead(CONFIG_FILE, "Window", "Y", "")
+
+    if (savedX != "" && savedY != "" && IsInteger(savedX) && IsInteger(savedY)) {
+        mainGui.Show("x" savedX " y" savedY " w510 h250")
+        Log("Окно показано в сохранённой позиции: X=" savedX ", Y=" savedY)
+    } else {
+        mainGui.Show("w510 h250")
+        Log("Окно показано в позиции по умолчанию")
+    }
+
+    ; Сохраняем позицию при закрытии окна
+    mainGui.OnEvent("Close", (*) => (SaveWindowPosition(), ExitApp()))
+
+    ; Отслеживаем завершение перемещения окна через WM_EXITSIZEMOVE
+    OnMessage(0x0232, WM_EXITSIZEMOVE)
 
     ; Проверяем состояние кнопки "Сброс" при запуске
     UpdateResetButtonState(folderCombo)
+
+    ; Обновляем отображение восстановленных сессий
+    UpdateSessionsDisplay()
+}
+
+; === ОБРАБОТЧИК СООБЩЕНИЯ WM_EXITSIZEMOVE ===
+WM_EXITSIZEMOVE(wParam, lParam, msg, hwnd) {
+    global mainGui
+
+    ; Проверяем, что это наше окно
+    if (hwnd = mainGui.Hwnd) {
+        SaveWindowPosition()
+    }
+}
+
+; === ПРОВЕРКА НА ЦЕЛОЕ ЧИСЛО ===
+IsInteger(value) {
+    if (value = "") {
+        return false
+    }
+    return (value ~= "^-?\d+$")
+}
+
+; === СОХРАНЕНИЕ ПОЗИЦИИ ОКНА ===
+SaveWindowPosition() {
+    global mainGui, CONFIG_FILE
+
+    try {
+        mainGui.GetPos(&x, &y)
+        IniWrite(x, CONFIG_FILE, "Window", "X")
+        IniWrite(y, CONFIG_FILE, "Window", "Y")
+        Log("Позиция окна сохранена: X=" x ", Y=" y)
+    } catch as err {
+        Log("Ошибка сохранения позиции окна: " err.Message, "ERROR")
+    }
+}
+
+; === ОБРАБОТЧИК ЧЕКБОКСА ПРОПУСКА РАЗРЕШЕНИЙ ===
+OnSkipPermissionsClick(checkbox, parentGui) {
+    global CONFIG_FILE
+
+    ; Если чекбокс включается
+    if (checkbox.Value) {
+        ; Проверяем настройку "Больше не спрашивать"
+        dontAskAgain := IniRead(CONFIG_FILE, "Settings", "SkipPermissionsDontAsk", "0")
+
+        if (dontAskAgain != "1") {
+            ; Создаём диалоговое окно с предупреждением
+            confirmGui := Gui("+Owner" parentGui.Hwnd " +ToolWindow", "Предупреждение")
+            confirmGui.SetFont("s10")
+            confirmGui.Add("Text", "x10 y10 w300", "Вы уверены?`nВключайте этот режим на свой страх и риск!")
+
+            dontAskCB := confirmGui.Add("Checkbox", "x10 y+10", "Больше не спрашивать")
+
+            okBtn := confirmGui.Add("Button", "x10 y+20 w145 h30 Default", "ОК")
+            cancelBtn := confirmGui.Add("Button", "x+10 yp w145 h30", "Отмена")
+
+            result := ""
+            dontAskValue := false
+            okBtn.OnEvent("Click", (*) => (result := "OK", dontAskValue := dontAskCB.Value, confirmGui.Destroy()))
+            cancelBtn.OnEvent("Click", (*) => (result := "Cancel", confirmGui.Destroy()))
+            confirmGui.OnEvent("Close", (*) => (result := "Cancel", confirmGui.Destroy()))
+            confirmGui.OnEvent("Escape", (*) => (result := "Cancel", confirmGui.Destroy()))
+
+            parentGui.Opt("+Disabled")
+            confirmGui.Show()
+
+            ; Ждём закрытия окна
+            WinWaitClose("ahk_id " confirmGui.Hwnd)
+            parentGui.Opt("-Disabled")
+
+            if (result = "Cancel") {
+                ; Отменяем включение чекбокса
+                checkbox.Value := false
+                return
+            }
+
+            ; Сохраняем настройку "Больше не спрашивать"
+            if (dontAskValue) {
+                IniWrite("1", CONFIG_FILE, "Settings", "SkipPermissionsDontAsk")
+            }
+        }
+
+        ; Сохраняем состояние чекбокса
+        IniWrite("1", CONFIG_FILE, "Settings", "SkipPermissions")
+    } else {
+        ; Сохраняем отключённое состояние
+        IniWrite("0", CONFIG_FILE, "Settings", "SkipPermissions")
+    }
 }
 
 ; === СБРОС СЕССИИ ===
@@ -229,7 +436,7 @@ ResetSession(folderCombo, statusText) {
     }
 
     ; Проверяем настройку "Больше не спрашивать"
-    dontAskAgain := IniRead(A_ScriptDir "\cc_launcher.ini", "Settings", "ResetDontAsk", "0")
+    dontAskAgain := IniRead(CONFIG_FILE, "Settings", "ResetDontAsk", "0")
 
     if (dontAskAgain != "1") {
         ; Создаём диалоговое окно с чекбоксом
@@ -261,7 +468,7 @@ ResetSession(folderCombo, statusText) {
 
         ; Сохраняем настройку "Больше не спрашивать"
         if (dontAskCB.Value) {
-            IniWrite("1", A_ScriptDir "\cc_launcher.ini", "Settings", "ResetDontAsk")
+            IniWrite("1", CONFIG_FILE, "Settings", "ResetDontAsk")
         }
     }
 
@@ -740,10 +947,38 @@ UpdateSessionsDisplay() {
         yPos += 35
     }
 
-    ; Изменяем размер окна с отступами
+    ; Получаем текущую позицию и размер окна
+    mainGui.GetPos(&currentX, &currentY, &currentWidth, &currentHeight)
+
+    ; Вычисляем новую высоту
     newHeight := 230 + (activeSessions.Count * 35) + 10
-    Log("Изменение размера окна на высоту: " newHeight)
-    mainGui.Move(, , 530, newHeight)
+    heightDiff := newHeight - currentHeight
+
+    ; Если окно увеличивается, проверяем, не выйдет ли оно за пределы экрана
+    if (heightDiff > 0) {
+        ; Получаем размер рабочей области экрана (без панели задач)
+        MonitorGetWorkArea(, , , , &workAreaBottom)
+
+        ; Вычисляем, где будет нижний край окна после увеличения
+        newBottomEdge := currentY + newHeight
+
+        ; Если окно выходит за пределы рабочей области, сдвигаем его вверх
+        if (newBottomEdge > workAreaBottom) {
+            newY := workAreaBottom - newHeight
+            ; Проверяем, чтобы окно не вышло за верхнюю границу экрана
+            if (newY < 0) {
+                newY := 0
+            }
+            Log("Окно выходит за пределы экрана, сдвиг вверх: Y " currentY " -> " newY)
+            mainGui.Move(currentX, newY, 530, newHeight)
+        } else {
+            Log("Изменение размера окна на высоту: " newHeight " (сдвиг не требуется)")
+            mainGui.Move(, , 530, newHeight)
+        }
+    } else {
+        Log("Изменение размера окна на высоту: " newHeight)
+        mainGui.Move(, , 530, newHeight)
+    }
 }
 
 ; === ПОЛУЧЕНИЕ ИМЕНИ ПАПКИ ===
@@ -786,11 +1021,38 @@ OpenFolder(folderPath) {
 
 ; === АКТИВАЦИЯ СЕССИИ ===
 ActivateSession(folderPath, pid) {
-    ; Находим окно cmd по PID
-    try {
-        WinActivate("ahk_pid " pid)
-    } catch {
-        MsgBox("Не удалось активировать окно сессии", "Ошибка", "Icon!")
+    Log("Попытка переключения на сессию: PID=" pid ", Папка=" folderPath)
+
+    ; Сначала пробуем найти окно по PID (для CMD процессов)
+    hwnd := WinExist("ahk_pid " pid)
+
+    if (!hwnd) {
+        ; Если не найдено, ищем родительское окно CMD
+        ; (для случаев, когда PID - это node.exe)
+        try {
+            result := ComObjGet("winmgmts:").ExecQuery("SELECT ParentProcessId FROM Win32_Process WHERE ProcessId=" pid)
+            for process in result {
+                parentPid := process.ParentProcessId
+                hwnd := WinExist("ahk_pid " parentPid)
+                if (hwnd) {
+                    Log("Найдено родительское окно: ParentPID=" parentPid)
+                    break
+                }
+            }
+        }
+    }
+
+    if (hwnd) {
+        try {
+            WinActivate("ahk_id " hwnd)
+            Log("Успешно переключено на окно сессии")
+        } catch as err {
+            Log("Ошибка активации окна: " err.Message, "ERROR")
+            MsgBox("Не удалось переключиться на окно сессии", "Ошибка", "Icon!")
+        }
+    } else {
+        Log("Окно сессии не найдено", "WARN")
+        MsgBox("Не удалось найти окно сессии", "Ошибка", "Icon!")
     }
 }
 
